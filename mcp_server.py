@@ -23,7 +23,6 @@ Available tools:
 
 import json
 import sys
-import asyncio
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -169,66 +168,134 @@ TOOL_SCHEMAS = [
 ]
 
 
-async def main():
-    """Simple MCP server over stdin/stdout (JSON-RPC 2.0)."""
-    reader = asyncio.StreamReader()
-    protocol = asyncio.StreamReaderProtocol(reader)
-    await asyncio.get_event_loop().connect_read_pipe(lambda: protocol, sys.stdin.buffer)
-    writer_transport, writer_protocol = await asyncio.get_event_loop().connect_write_pipe(
-        lambda: asyncio.BaseProtocol(), sys.stdout.buffer
-    )
+# ------------------------------------------------------------------
+# JSON-RPC 2.0 dispatch (pure — no I/O, so it's unit-testable)
+# ------------------------------------------------------------------
 
-    def send(obj):
-        line = json.dumps(obj) + "\n"
-        sys.stdout.buffer.write(line.encode())
-        sys.stdout.buffer.flush()
+# JSON-RPC standard error codes
+PARSE_ERROR = -32700
+INVALID_REQUEST = -32600
+METHOD_NOT_FOUND = -32601
+INTERNAL_ERROR = -32603
 
-    while True:
-        line = await reader.readline()
-        if not line:
-            break
+_SERVER_INFO = {
+    "protocolVersion": "2024-11-05",
+    "capabilities": {"tools": {}},
+    "serverInfo": {"name": "ctx-gate", "version": "0.1.0"},
+}
+
+
+def _error(req_id, code: int, message: str) -> dict:
+    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+
+
+def _result(req_id, result: dict) -> dict:
+    return {"jsonrpc": "2.0", "id": req_id, "result": result}
+
+
+def dispatch(req: dict) -> dict | None:
+    """
+    Handle one parsed JSON-RPC request and return the response dict, or None when
+    no response should be sent (notifications — requests without an "id").
+
+    Never raises: a failing tool is reported as an MCP tool error, and any other
+    exception becomes a JSON-RPC internal error, so a single bad message can't
+    take the server down.
+    """
+    if not isinstance(req, dict):
+        return _error(None, INVALID_REQUEST, "Invalid Request")
+
+    method = req.get("method")
+    is_notification = "id" not in req
+    req_id = req.get("id")
+
+    if method == "initialize":
+        result = dict(_SERVER_INFO)
+    elif method == "tools/list":
+        result = {"tools": TOOL_SCHEMAS}
+    elif method == "tools/call":
+        params = req.get("params") or {}
+        name = params.get("name", "")
+        arguments = params.get("arguments") or {}
         try:
-            req = json.loads(line.decode())
-        except json.JSONDecodeError:
+            tool_result = handle_tool(name, arguments)
+        except Exception as e:  # a misbehaving tool must not crash the server
+            tool_result = {"error": f"{type(e).__name__}: {e}"}
+        result = {
+            "content": [{"type": "text", "text": json.dumps(tool_result, indent=2)}],
+            "isError": "error" in tool_result,
+        }
+    elif method == "ping":
+        result = {}
+    elif method and method.startswith("notifications/"):
+        return None  # client notifications (e.g. initialized) need no reply
+    else:
+        return None if is_notification else _error(req_id, METHOD_NOT_FOUND,
+                                                   f"Method not found: {method}")
+
+    return None if is_notification else _result(req_id, result)
+
+
+def handle_line(line: str) -> str | None:
+    """Parse one input line and return the serialized response line, or None."""
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        req = json.loads(line)
+    except json.JSONDecodeError:
+        return json.dumps(_error(None, PARSE_ERROR, "Parse error"))
+    try:
+        resp = dispatch(req)
+    except Exception as e:  # defensive: dispatch already guards, but never crash
+        resp = _error(req.get("id") if isinstance(req, dict) else None,
+                      INTERNAL_ERROR, f"Internal error: {e}")
+    return json.dumps(resp) if resp is not None else None
+
+
+# ------------------------------------------------------------------
+# Synchronous stdio transport
+# ------------------------------------------------------------------
+
+def _configure_stdio() -> None:
+    """
+    UTF-8 in/out with no newline translation. JSON-RPC over stdio is newline
+    framed, so a Windows \\r\\n rewrite would corrupt the framing; cp1252 would
+    fail to encode non-ASCII tool output.
+    """
+    try:
+        sys.stdin.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+    except (AttributeError, ValueError):
+        pass
+
+
+def serve() -> None:
+    """
+    Blocking stdin/stdout JSON-RPC loop. Synchronous on purpose: the handlers are
+    sync, and this avoids asyncio pipe setup that isn't supported for stdio on the
+    Windows Proactor event loop. Exits cleanly on EOF or a closed output pipe.
+    """
+    _configure_stdio()
+    while True:
+        try:
+            line = sys.stdin.readline()
+        except (KeyboardInterrupt, EOFError):
+            break
+        if line == "":  # EOF — client closed the pipe
+            break
+        out = handle_line(line)
+        if out is None:
             continue
-
-        method = req.get("method", "")
-        req_id = req.get("id")
-
-        if method == "initialize":
-            send({
-                "jsonrpc": "2.0", "id": req_id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "ctx-gate", "version": "0.1.0"},
-                },
-            })
-
-        elif method == "tools/list":
-            send({"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOL_SCHEMAS}})
-
-        elif method == "tools/call":
-            tool_name = req.get("params", {}).get("name", "")
-            tool_params = req.get("params", {}).get("arguments", {})
-            result = handle_tool(tool_name, tool_params)
-            send({
-                "jsonrpc": "2.0", "id": req_id,
-                "result": {
-                    "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
-                    "isError": "error" in result,
-                },
-            })
-
-        elif method == "notifications/initialized":
-            pass  # no response needed
-
-        else:
-            send({
-                "jsonrpc": "2.0", "id": req_id,
-                "error": {"code": -32601, "message": f"Method not found: {method}"},
-            })
+        try:
+            sys.stdout.write(out + "\n")
+            sys.stdout.flush()
+        except (BrokenPipeError, OSError):
+            break  # client went away; stop quietly
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    serve()
