@@ -186,6 +186,8 @@ ctx-gate serve --recency-window=10      # keep 10 recent turns verbatim
 ctx-gate serve --token-budget=20000     # hard cap; drop least-relevant turns to fit
 ctx-gate serve --llm-summary            # summarize old turns with the fast tier
 ctx-gate serve --rag --project-root=.   # inject only semantically-relevant code chunks
+ctx-gate serve --retries=3              # retry transient upstream failures (default 2)
+ctx-gate serve --max-sessions=256       # cap isolated client sessions (LRU, default 128)
 ctx-gate serve --verbose                # log compression stats per request
 
 ctx-gate status                         # show stats (proxy must be running)
@@ -280,37 +282,44 @@ The harness is designed to be able to *fail* the product's own claim — the tes
 
 ## Stats
 
+Aggregate counters are persisted to `.ctx-gate/stats.json`, so they survive proxy restarts:
+
 ```bash
 $ ctx-gate status
 {
-  "session_id": "a3f8c1d2",
+  "instance_id": "a3f8c1d2",
+  "active_sessions": 3,
   "requests_proxied": 47,
   "tokens_saved_estimate": 83400,
   "task_shifts_detected": 3
 }
 ```
 
+## Multiple clients
+
+Each client conversation gets its own isolated state (file-diff memory, task-shift history, checkpoint counters), keyed by an `x-ctx-gate-session` request header. Without the header everything shares a single `default` session, so single-client use is unchanged. Sessions are LRU-capped (`--max-sessions`, default 128).
+
 ---
 
 ## Status & Known Limitations
 
-ctx-gate is **early but real** — every feature documented above is wired into the request path and covered by tests (`pytest -q` → 69 passing). What that does and doesn't mean:
+ctx-gate is **early but real** — every feature documented above is wired into the request path and covered by tests (`pytest -q` → 104 passing). What that does and doesn't mean:
 
 **Working today**
 - Native Anthropic `/v1/messages` (with streaming) and OpenAI `/v1/chat/completions`.
 - **Streaming in both directions**, including OpenAI-format clients streaming against a Claude backend — the Anthropic SSE is translated to OpenAI `chat.completion.chunk` SSE on the fly (text and tool-call deltas).
 - Task-shift clearing, context compression, relevance-scored retention, file-diff injection, tool-output truncation, model routing (routed model is applied upstream), token budgeting, snapshot checkpoints, optional RAG, optional LLM summary.
+- **Per-session isolation** (per-client state keyed by header), **persistent stats** (survive restarts), and **upstream resilience** (retries with backoff on transient errors, clean 502s instead of crashes).
 - A faithfulness harness with a CI gate.
 
 **Known limitations / rough edges**
 - **Checkpoints are snapshot-based, not event-based** — a proxy can't see individual tool calls, so checkpoint counts are derived from conversation history, not a live tool-call stream.
 - **Relevance scoring is lexical** (bag-of-words overlap), not embedding-based. It reliably catches keyword-overlapping facts; paraphrased probes may need the RAG path.
 - **`--llm-summary` adds latency** (one fast-model call per compressed request) and is off by default.
-- **Stats are in-memory** and reset when the proxy restarts.
+- **Streaming retries are connection-only** — a transient failure *before* the first byte is handled gracefully, but a drop mid-stream isn't retried (retrying would duplicate already-sent tokens).
 - Model IDs in `ModelRouter` are sensible defaults, not guaranteed current for every provider — override per tier as needed.
 
 **Roadmap**
-- Persistent stats + per-session isolation, upstream retry/resilience.
 - Embedding-based relevance scoring shared with the RAG store.
 
 ---
@@ -319,7 +328,7 @@ ctx-gate is **early but real** — every feature documented above is wired into 
 
 ```bash
 pip install -e ".[dev,tokenizer]"      # editable install with test + tokenizer deps
-pytest -q                              # run the suite (69 tests)
+pytest -q                              # run the suite (104 tests)
 ctx-gate eval --min-retention 1.0      # run the faithfulness gate locally
 ```
 

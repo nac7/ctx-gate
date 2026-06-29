@@ -40,6 +40,8 @@ def cmd_serve(args):
         project_root=args.project_root,
         token_budget=args.token_budget,
         llm_summary=args.llm_summary,
+        max_sessions=args.max_sessions,
+        max_retries=args.retries,
     )
 
 
@@ -141,6 +143,10 @@ def main():
                          help="Hard cap on tokens per request; drops least-relevant turns to fit")
     p_serve.add_argument("--llm-summary", action="store_true",
                          help="Summarize old turns with the fast-tier model (vs extractive)")
+    p_serve.add_argument("--max-sessions", type=int, default=128,
+                         help="Max isolated client sessions to keep (LRU-evicted)")
+    p_serve.add_argument("--retries", type=int, default=2,
+                         help="Retry attempts for transient upstream failures (default: 2)")
     p_serve.set_defaults(func=cmd_serve)
 
     # status

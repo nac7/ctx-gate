@@ -20,7 +20,6 @@ import uuid
 import os
 import sys
 import asyncio
-from typing import AsyncIterator
 from pathlib import Path
 
 try:
@@ -35,10 +34,9 @@ except ImportError:
 # Add parent to path for local imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.compressor.compressor import ContextCompressor
-from src.compressor.task_shift import TaskShiftDetector
-from src.checkpoint import CheckpointWriter
 from src.router import ModelRouter
+from src.proxy.sessions import SessionRegistry
+from src.proxy.stats import StatsStore
 from src.proxy.sse import (
     AnthropicToOpenAITranslator,
     parse_sse_data_line,
@@ -75,6 +73,9 @@ def create_app(
     project_root: str = ".",
     token_budget: int | None = None,
     llm_summary: bool = False,
+    max_sessions: int = 128,
+    max_retries: int = 2,
+    session_header: str = "x-ctx-gate-session",
 ) -> FastAPI:
     app = FastAPI(title="ctx-gate", version="0.1.0")
 
@@ -90,13 +91,15 @@ def create_app(
             print(f"[ctx-gate] LLM summary disabled: {e}")
             summarizer_fn = None
 
-    compressor = ContextCompressor(
+    # Per-session isolation: each client conversation gets its own compressor /
+    # task-shift detector / checkpoint state, keyed by a request header.
+    sessions = SessionRegistry(
         recency_window=recency_window,
         token_budget=token_budget,
         summarizer_fn=summarizer_fn,
+        checkpoint_dir=checkpoint_dir,
+        max_sessions=max_sessions,
     )
-    shift_detector = TaskShiftDetector()
-    checkpoint = CheckpointWriter(checkpoint_dir=checkpoint_dir)
     router = ModelRouter(provider=provider, force_tier=force_tier)
 
     # Optional RAG retrieval. Falls back to a TF-IDF / in-memory store when the
@@ -113,8 +116,8 @@ def create_app(
             print(f"[ctx-gate] RAG disabled (index failed): {e}")
             indexer = None
 
-    session_id = str(uuid.uuid4())[:8]
-    stats = {"requests": 0, "tokens_saved": 0, "shifts_detected": 0}
+    instance_id = str(uuid.uuid4())[:8]
+    stats = StatsStore(str(Path(checkpoint_dir) / "stats.json"))
 
     base_url = PROVIDER_URLS.get(provider, PROVIDER_URLS["openai"])
     api_key_env = PROVIDER_API_KEY_ENV.get(provider)
@@ -127,17 +130,20 @@ def create_app(
         return {
             "status": "ok",
             "provider": provider,
-            "session_id": session_id,
-            "stats": stats,
+            "instance_id": instance_id,
+            "active_sessions": len(sessions),
+            "stats": stats.snapshot(),
         }
 
     @app.get("/stats")
     async def get_stats():
+        snap = stats.snapshot()
         return {
-            "session_id": session_id,
-            "requests_proxied": stats["requests"],
-            "tokens_saved_estimate": stats["tokens_saved"],
-            "task_shifts_detected": stats["shifts_detected"],
+            "instance_id": instance_id,
+            "active_sessions": len(sessions),
+            "requests_proxied": snap["requests"],
+            "tokens_saved_estimate": snap["tokens_saved"],
+            "task_shifts_detected": snap["shifts_detected"],
         }
 
     def _current_prompt(messages: list[dict]) -> str:
@@ -150,20 +156,23 @@ def create_app(
             )
         return current
 
-    def _run_pipeline(messages: list[dict], current_prompt: str):
+    def _run_pipeline(session, messages: list[dict], current_prompt: str):
         """
         Shared request pipeline: task-shift clear → checkpoint inject →
         compress → route. Used by both the OpenAI and Anthropic endpoints.
 
-        Returns (compression_result, routing_decision). The compressed,
-        system-normalized message list is on `result.messages`.
+        Operates on the given session's isolated state and records aggregate
+        stats once. Returns (compression_result, routing_decision); the
+        compressed, system-normalized message list is on `result.messages`.
         """
+        compressor = session.compressor
+        shift_detector = session.shift_detector
+        checkpoint = session.checkpoint
         incoming = list(messages)  # snapshot before any task-shift trimming
 
         # ── Detect task shift ──
         shift = shift_detector.detect(current_prompt, messages)
         if shift.is_shift:
-            stats["shifts_detected"] += 1
             if verbose:
                 print(f"[ctx-gate] Task shift detected (confidence={shift.confidence:.2f}): {shift.reason}")
             carry_note = ""
@@ -190,8 +199,7 @@ def create_app(
 
         # ── Compress context ──
         result = compressor.compress(messages, current_prompt)
-        stats["tokens_saved"] += max(0, result.original_tokens - result.compressed_tokens)
-        stats["requests"] += 1
+        tokens_saved = max(0, result.original_tokens - result.compressed_tokens)
         if verbose:
             print(
                 f"[ctx-gate] Compressed {result.original_tokens}->{result.compressed_tokens} tokens "
@@ -203,9 +211,12 @@ def create_app(
             result.messages, rag_saved = _inject_rag_context(
                 indexer, current_prompt, result.messages
             )
-            stats["tokens_saved"] += rag_saved
+            tokens_saved += rag_saved
             if verbose and rag_saved:
                 print(f"[ctx-gate] RAG injected relevant chunks (~{rag_saved} tokens saved vs full files)")
+
+        # ── Record aggregate stats once (persisted) ──
+        stats.record_request(tokens_saved=tokens_saved, shift=shift.is_shift)
 
         # ── Route to best model ──
         routing = router.route(current_prompt, result.compressed_tokens)
@@ -218,7 +229,7 @@ def create_app(
 
         # ── Periodically checkpoint session state (never fail a request over it) ──
         try:
-            written = checkpoint.observe_conversation(incoming, session_id)
+            written = checkpoint.observe_conversation(incoming, session.id)
             if written and verbose:
                 print(f"[ctx-gate] Checkpoint written: {written}")
         except Exception as e:
@@ -233,8 +244,9 @@ def create_app(
         messages = body.get("messages", [])
         stream = body.get("stream", False)
 
+        session = sessions.get(request.headers.get(session_header))
         current_prompt = _current_prompt(messages)
-        result, routing = _run_pipeline(messages, current_prompt)
+        result, routing = _run_pipeline(session, messages, current_prompt)
 
         # Build upstream request — routed model is authoritative for providers
         # with a known tier map; otherwise (e.g. Ollama) keep the client's model.
@@ -276,8 +288,9 @@ def create_app(
         conv = body.get("messages", [])
         normalized = ([{"role": "system", "content": system_text}] if system_text else []) + conv
 
+        session = sessions.get(request.headers.get(session_header))
         current_prompt = _current_prompt(normalized)
-        result, routing = _run_pipeline(normalized, current_prompt)
+        result, routing = _run_pipeline(session, normalized, current_prompt)
 
         # Split the compressed list back into Anthropic shape: all system content
         # (original + injected summary/checkpoint) folds into the `system` field.
@@ -315,17 +328,24 @@ def create_app(
     # ------------------------------------------------------------------
 
     async def _forward_openai(url: str, body: dict, headers: dict, stream: bool):
-        async with httpx.AsyncClient(timeout=120) as client:
-            if stream:
-                async def streamer():
-                    async with client.stream("POST", url, json=body, headers=headers) as r:
-                        async for chunk in r.aiter_bytes():
-                            yield chunk
-                return StreamingResponse(streamer(), media_type="text/event-stream")
-            else:
-                r = await client.post(url, json=body, headers=headers)
-                return Response(content=r.content, status_code=r.status_code,
-                                media_type="application/json")
+        if stream:
+            async def streamer():
+                try:
+                    async with httpx.AsyncClient(timeout=120) as client:
+                        async with client.stream("POST", url, json=body, headers=headers) as r:
+                            async for chunk in r.aiter_bytes():
+                                yield chunk
+                except httpx.TransportError as e:
+                    yield json.dumps({"error": {"type": "upstream_unavailable",
+                                                "message": str(e)}}).encode()
+            return StreamingResponse(streamer(), media_type="text/event-stream")
+
+        try:
+            r = await _post_with_retries(url, body, headers, attempts=max_retries + 1)
+        except httpx.TransportError as e:
+            return _upstream_error(e)
+        return Response(content=r.content, status_code=r.status_code,
+                        media_type="application/json")
 
     async def _forward_anthropic(body: dict, headers: dict, stream: bool,
                                  convert_to_openai: bool = False):
@@ -347,21 +367,27 @@ def create_app(
             else:
                 # Native /v1/messages caller: pass Anthropic SSE through verbatim.
                 async def gen():
-                    async with httpx.AsyncClient(timeout=120) as client:
-                        async with client.stream("POST", url, json=body, headers=headers) as r:
-                            async for chunk in r.aiter_bytes():
-                                yield chunk
+                    try:
+                        async with httpx.AsyncClient(timeout=120) as client:
+                            async with client.stream("POST", url, json=body, headers=headers) as r:
+                                async for chunk in r.aiter_bytes():
+                                    yield chunk
+                    except httpx.TransportError as e:
+                        yield json.dumps({"type": "error", "error": {
+                            "type": "upstream_unavailable", "message": str(e)}}).encode()
                 gen = gen()
             return StreamingResponse(gen, media_type="text/event-stream")
 
-        async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(url, json=body, headers=headers)
-            # OpenAI-compat callers asked for chat.completion shape; convert.
-            # Native /v1/messages callers want Anthropic's response untouched.
-            if r.status_code == 200 and convert_to_openai:
-                return JSONResponse(content=_anthropic_to_openai(r.json()))
-            return Response(content=r.content, status_code=r.status_code,
-                            media_type="application/json")
+        try:
+            r = await _post_with_retries(url, body, headers, attempts=max_retries + 1)
+        except httpx.TransportError as e:
+            return _upstream_error(e)
+        # OpenAI-compat callers asked for chat.completion shape; convert.
+        # Native /v1/messages callers want Anthropic's response untouched.
+        if r.status_code == 200 and convert_to_openai:
+            return JSONResponse(content=_anthropic_to_openai(r.json()))
+        return Response(content=r.content, status_code=r.status_code,
+                        media_type="application/json")
 
     def _anthropic_system_text(system) -> str:
         """Anthropic `system` may be a string or a list of text blocks."""
@@ -438,6 +464,8 @@ def run_server(
     project_root: str = ".",
     token_budget: int | None = None,
     llm_summary: bool = False,
+    max_sessions: int = 128,
+    max_retries: int = 2,
 ):
     app = create_app(
         provider=provider,
@@ -448,6 +476,8 @@ def run_server(
         project_root=project_root,
         token_budget=token_budget,
         llm_summary=llm_summary,
+        max_sessions=max_sessions,
+        max_retries=max_retries,
     )
     print(f"ctx-gate proxy -> {PROVIDER_URLS.get(provider, provider)}")
     print(f"Listening on http://{host}:{port}/v1")
@@ -455,29 +485,73 @@ def run_server(
     print(f"Provider: {provider} | Recency window: {recency_window} turns | RAG: {'on' if rag else 'off'}")
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
-# RAG integration helper (called from create_app when --rag flag is set)
+
+# Upstream statuses worth retrying (rate limit + transient server errors).
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+def _upstream_error(exc: Exception, status: int = 502) -> "JSONResponse":
+    """A clean error response when the upstream provider can't be reached."""
+    return JSONResponse(status_code=status, content={"error": {
+        "type": "upstream_unavailable",
+        "message": f"ctx-gate could not reach the upstream provider: {exc}",
+    }})
+
+
+async def _post_with_retries(url: str, body: dict, headers: dict, *,
+                             attempts: int, timeout: float = 120):
+    """
+    POST with bounded retries on transient transport errors and retryable
+    statuses (exponential backoff). Returns the final httpx.Response; raises
+    httpx.TransportError only if every connection attempt fails.
+    """
+    delay = 0.5
+    for i in range(attempts):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.post(url, json=body, headers=headers)
+            if r.status_code in _RETRYABLE_STATUS and i < attempts - 1:
+                await asyncio.sleep(delay)
+                delay *= 2
+                continue
+            return r
+        except httpx.TransportError:
+            if i < attempts - 1:
+                await asyncio.sleep(delay)
+                delay *= 2
+                continue
+            raise
+
+
 async def _anthropic_to_openai_sse(url: str, body: dict, headers: dict):
     """
     Stream Anthropic Messages SSE from `url` and yield OpenAI chat.completion.chunk
     SSE frames. Used when an OpenAI-format client streams against a Claude backend.
     """
     translator = AnthropicToOpenAITranslator(model=body.get("model", ""))
-    async with httpx.AsyncClient(timeout=120) as client:
-        async with client.stream("POST", url, json=body, headers=headers) as r:
-            if r.status_code != 200:
-                err = await r.aread()
-                yield format_sse({"error": {
-                    "message": err.decode("utf-8", "replace"),
-                    "code": r.status_code,
-                }})
-                yield DONE
-                return
-            async for line in r.aiter_lines():
-                event = parse_sse_data_line(line)
-                if event is None:
-                    continue
-                for chunk in translator.feed(event):
-                    yield format_sse(chunk)
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            async with client.stream("POST", url, json=body, headers=headers) as r:
+                if r.status_code != 200:
+                    err = await r.aread()
+                    yield format_sse({"error": {
+                        "message": err.decode("utf-8", "replace"),
+                        "code": r.status_code,
+                    }})
+                    yield DONE
+                    return
+                async for line in r.aiter_lines():
+                    event = parse_sse_data_line(line)
+                    if event is None:
+                        continue
+                    for chunk in translator.feed(event):
+                        yield format_sse(chunk)
+    except httpx.TransportError as e:
+        # Connection dropped (typically before streaming began) — emit a clean
+        # error frame instead of letting the exception break the response.
+        yield format_sse({"error": {"type": "upstream_unavailable", "message": str(e)}})
+        yield DONE
+        return
     for chunk in translator.finish():
         yield format_sse(chunk)
     yield DONE

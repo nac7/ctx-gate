@@ -113,11 +113,12 @@ class FakeAsyncClient:
 
 
 @pytest.fixture
-def claude_client(monkeypatch):
+def claude_client(monkeypatch, tmp_path):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
     monkeypatch.setattr(server.httpx, "AsyncClient", FakeAsyncClient)
     FakeAsyncClient.captured = {}
-    app = create_app(provider="claude", verbose=False)
+    # Per-test checkpoint/stats dir so persistent stats don't bleed across tests.
+    app = create_app(provider="claude", verbose=False, checkpoint_dir=str(tmp_path))
     return TestClient(app)
 
 
@@ -221,6 +222,28 @@ class TestChatCompletionsEndpoint:
 
 
 # ── Router registry fixes ─────────────────────────────────────────────────────
+
+class TestSessionWiring:
+
+    def test_distinct_session_headers_tracked(self, claude_client):
+        for sid in ("alice", "bob", "alice"):
+            claude_client.post("/v1/messages", json={
+                "model": "claude-sonnet-4-6", "max_tokens": 50,
+                "messages": [{"role": "user", "content": "add an endpoint"}],
+            }, headers={"x-ctx-gate-session": sid})
+        stats = claude_client.get("/stats").json()
+        assert stats["active_sessions"] == 2          # alice + bob, not 3
+        assert stats["requests_proxied"] == 3
+
+    def test_stats_persist_to_disk(self, claude_client):
+        # /stats reflects the persistent store; a request bumps the counter.
+        before = claude_client.get("/stats").json()["requests_proxied"]
+        claude_client.post("/v1/chat/completions", json={
+            "model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}],
+        })
+        after = claude_client.get("/stats").json()["requests_proxied"]
+        assert after == before + 1
+
 
 class TestRouterRegistry:
 
