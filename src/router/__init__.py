@@ -89,6 +89,10 @@ class ModelRouter:
         self.provider = provider
         self.default_tier = default_tier
         self.force_tier = force_tier
+        # Whether this provider has a known tier->model map. Providers that don't
+        # (e.g. Ollama and other local/custom backends) keep the client's chosen
+        # model — see `routes_models`. Tier classification still runs for logging.
+        self.routes_models = provider in PROVIDER_TIERS or bool(tier_overrides)
         self.tiers = dict(PROVIDER_TIERS.get(provider, CLAUDE_TIERS))
         if tier_overrides:
             self.tiers.update(tier_overrides)

@@ -194,7 +194,7 @@ def create_app(
         stats["requests"] += 1
         if verbose:
             print(
-                f"[ctx-gate] Compressed {result.original_tokens}→{result.compressed_tokens} tokens "
+                f"[ctx-gate] Compressed {result.original_tokens}->{result.compressed_tokens} tokens "
                 f"({result.savings_pct}% saved, summary={'yes' if result.summary_injected else 'no'})"
             )
 
@@ -210,7 +210,11 @@ def create_app(
         # ── Route to best model ──
         routing = router.route(current_prompt, result.compressed_tokens)
         if verbose:
-            print(f"[ctx-gate] Model: {routing.model} ({routing.tier}, reason: {routing.reason})")
+            if router.routes_models:
+                print(f"[ctx-gate] Model: {routing.model} ({routing.tier}, reason: {routing.reason})")
+            else:
+                print(f"[ctx-gate] Model: client's choice kept for provider '{provider}' "
+                      f"(classified tier: {routing.tier})")
 
         # ── Periodically checkpoint session state (never fail a request over it) ──
         try:
@@ -232,10 +236,12 @@ def create_app(
         current_prompt = _current_prompt(messages)
         result, routing = _run_pipeline(messages, current_prompt)
 
-        # Build upstream request — routed model is authoritative.
+        # Build upstream request — routed model is authoritative for providers
+        # with a known tier map; otherwise (e.g. Ollama) keep the client's model.
         upstream_body = dict(body)
         upstream_body["messages"] = result.messages
-        upstream_body["model"] = routing.model
+        if router.routes_models:
+            upstream_body["model"] = routing.model
 
         # Forward to provider
         headers = {"Content-Type": "application/json"}
@@ -283,7 +289,8 @@ def create_app(
 
         upstream_body = dict(body)
         upstream_body["messages"] = new_conv
-        upstream_body["model"] = routing.model
+        if router.routes_models:
+            upstream_body["model"] = routing.model
         if new_system_parts:
             upstream_body["system"] = "\n\n".join(new_system_parts)
         elif "system" in upstream_body:
@@ -442,7 +449,7 @@ def run_server(
         token_budget=token_budget,
         llm_summary=llm_summary,
     )
-    print(f"ctx-gate proxy → {PROVIDER_URLS.get(provider, provider)}")
+    print(f"ctx-gate proxy -> {PROVIDER_URLS.get(provider, provider)}")
     print(f"Listening on http://{host}:{port}/v1")
     print(f"Endpoints: /v1/chat/completions (OpenAI), /v1/messages (Anthropic-native)")
     print(f"Provider: {provider} | Recency window: {recency_window} turns | RAG: {'on' if rag else 'off'}")

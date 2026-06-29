@@ -16,6 +16,14 @@ import argparse
 import json
 from pathlib import Path
 
+# Force UTF-8 console output so banners/logs don't crash on legacy code pages
+# (e.g. Windows cp1252 can't encode characters like "->" arrows or bullets).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 

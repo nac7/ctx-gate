@@ -15,7 +15,7 @@ TASK_SHIFT_SIGNALS = [
     r"\b(can you|please)\s+(now\s+)?(work on|handle|tackle|build|create|fix|debug|refactor|write)\b",
     r"\b(new (task|issue|ticket|bug|feature|file|endpoint|component))\b",
     r"\b(forget (that|this|everything)|start over|start fresh|new chat|clear context)\b",
-    r"\b(switching to|moving on to|pivot(ing)? to)\b",
+    r"\b(switch(ing)? to|moving on to|pivot(ing)? to|let.{0,2}s switch)\b",
     r"\bnow\s+(let.{0,2}s\s+)?(work|build|create|implement|add|fix|debug|write)\b",
 ]
 

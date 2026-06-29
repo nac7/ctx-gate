@@ -232,6 +232,18 @@ class TestRouterRegistry:
         r = ModelRouter(provider="claude", tier_overrides={"advanced": "claude-custom"})
         assert r.route("redesign the entire architecture").model == "claude-custom"
 
+    def test_ollama_keeps_client_model(self, monkeypatch):
+        # Providers with no tier map (Ollama/local) must not have their model
+        # rewritten to a Claude name — the client's choice is forwarded as-is.
+        monkeypatch.setattr(server.httpx, "AsyncClient", FakeAsyncClient)
+        FakeAsyncClient.captured = {}
+        client = TestClient(create_app(provider="ollama"))
+        client.post("/v1/chat/completions", json={
+            "model": "llama3.1:8b",
+            "messages": [{"role": "user", "content": "fix the typo in line 5"}],
+        })
+        assert FakeAsyncClient.captured["json"]["model"] == "llama3.1:8b"
+
 
 # ── File-diff injection through compress() ────────────────────────────────────
 
